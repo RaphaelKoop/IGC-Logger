@@ -212,8 +212,8 @@ static void updateLED() {
 
   // SD missing/error -> ON 1.0s, OFF 0.5s, repeat
   if (!sdOK) {
-    uint32_t phase = now % 1500;
-    bool on = (phase < 1000);
+    uint32_t phase = now % 4000;
+    bool on = (phase < 2000);
     setLED(on);
     return;
   }
