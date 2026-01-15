@@ -289,25 +289,55 @@ void loop() {
   // Update LED continuously
   updateLED();
 
-  // Optional status print every 2s
+  // Optional status + altitude debug print every 2s
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > 2000) {
     lastStatus = millis();
+
     Serial.print("GPS time=");
     Serial.print(gpsTimeOK() ? "OK" : "NO");
     Serial.print(" fix=");
     Serial.print(gpsFixOK() ? "OK" : "NO");
+
     if (gps.satellites.isValid()) {
       Serial.print(" sats=");
       Serial.print(gps.satellites.value());
+    } else {
+      Serial.print(" sats=N/A");
     }
+
     Serial.print(" baro=");
     Serial.print(baroOK ? "OK" : "NO");
     Serial.print(" sd=");
     Serial.print(sdOK ? "OK" : "NO");
     Serial.print(" recording=");
     Serial.println(recording ? "YES" : "NO");
+
+    // ---- Altitude values ----
+    float gpsAlt = gps.altitude.isValid() ? gps.altitude.meters() : NAN;
+
+    float baroAlt = NAN;
+    if (baroOK) {
+      float p = bmp180.readPressure();      // Pa
+      baroAlt = (float)pressureAltMetersFromPa(p); // meters (QNE/ISA)
+    }
+
+    Serial.print("ALT baro=");
+    if (isfinite(baroAlt)) Serial.print(baroAlt, 1);
+    else Serial.print("N/A");
+
+    Serial.print(" m  gps=");
+    if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1);
+    else Serial.print("N/A");
+
+    if (isfinite(baroAlt) && isfinite(gpsAlt)) {
+      Serial.print(" m  diff=");
+      Serial.print(baroAlt - gpsAlt, 1);
+    }
+
+    Serial.println(" m");
   }
+
 
   // Write IGC B-record at 5 Hz while recording
   if (recording && millis() - lastLogMs >= LOG_INTERVAL_MS) {
