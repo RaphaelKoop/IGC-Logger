@@ -4,18 +4,25 @@
 // - BMP180 baro (I2C)
 // - microSD (SPI)
 // - Start/stop recording with BOOT button
+// - Start/stop recording with RC receiver PWM channel (optional)
 //
 // LOG RATE: 5 Hz (B-record every 200 ms)
 //
 // LED patterns (single LED):
-// - SD missing/error:   ON 1.0s, OFF 0.5s, repeat
+// - SD missing/error:   ON 2s, OFF 2s, repeat
 // - GPS time NOT OK:    fast blink (~5 Hz)
 // - GPS time OK no fix: slow blink (1 Hz)
 // - GPS fix OK:         solid ON (ready)
 // - RECORDING active:   double blink per second
 //
-// NOTE: Many ESP32-C3 "Super Mini" boards have the onboard LED active-LOW (LOW = ON).
-// This code supports that via LED_ACTIVE_LOW=true.
+// PWM control behavior (important):
+// - PWM can START a recording (if configured / connected)
+// - PWM can STOP a recording ONLY if PWM started it
+//   (so BOOT-start won't auto-stop when no PWM is connected)
+//
+// BARO ALTITUDE FIX:
+// - Logs BARO altitude as RELATIVE altitude (AGL-style) referenced to baro altitude at recording start.
+// - GPS altitude is still logged as the GPS altitude field in IGC.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -38,11 +45,17 @@ static const int PIN_I2C_SCL = 5;
 
 static const int PIN_BOOT_BTN = 9;
 
-// Built-in LED pin (try 8 first; if LED doesn't respond at all try 2)
-static const int LED_PIN = 8;
+// RC PWM input pin (connect receiver PWM signal here)
+static const int PIN_PWM_IN = 3;   // PWM signal to GPIO3
 
-// On many ESP32-C3 Super Mini boards LED is active-LOW: LOW=ON, HIGH=OFF
+// Built-in LED pin
+static const int LED_PIN = 8;
 static const bool LED_ACTIVE_LOW = true;
+
+// ---------------- PWM thresholds ----------------
+static const int PWM_START_US = 1600;       // start requested above this
+static const int PWM_STOP_US  = 1400;       // stop requested below this
+static const uint32_t PWM_TIMEOUT_MS = 500; // if signal lost -> disarm PWM
 
 // ---------------- Logging ----------------
 static const uint32_t LOG_INTERVAL_MS = 200; // 5 Hz
@@ -62,6 +75,19 @@ uint32_t lastLogMs = 0;
 // LED blink state
 uint32_t lastLedToggle = 0;
 bool ledState = false;
+
+// PWM state
+bool pwmWantsRec = false;
+bool pwmSeenEver = false;          // becomes true once we read a valid PWM pulse
+uint32_t lastPwmOkMs = 0;
+
+// Who started the current recording?
+enum RecOwner : uint8_t { OWNER_NONE = 0, OWNER_BOOT = 1, OWNER_PWM = 2 };
+RecOwner recOwner = OWNER_NONE;
+
+// Baro baseline (relative altitude)
+bool baroBaseSet = false;
+int  baroBaseAlt = 0;  // pressure altitude at start (meters, QNE/ISA)
 
 // ---------------- Helpers ----------------
 static String two(int v) { return (v < 10) ? "0" + String(v) : String(v); }
@@ -117,7 +143,7 @@ static String igcLon(double lon) {
 }
 
 static String igcAlt5(int meters) {
-  if (meters < 0) meters = 0;
+  if (meters < 0) meters = 0;         // clamp for IGC
   if (meters > 99999) meters = 99999;
   char buf[8];
   snprintf(buf, sizeof(buf), "%05d", meters);
@@ -145,7 +171,7 @@ static void writeIgcHeaders() {
   igcFile.print("AESP32C3\r\n");
   igcFile.printf("HFDTE%02d%02d%02d\r\n", dd, mm, yy);
   igcFile.print("HFDTM100GPSDATUM:WGS-1984\r\n");
-  igcFile.print("HFRFWFIRMWARE:ESP32-C3-RC-IGC-LED-5HZ\r\n");
+  igcFile.print("HFRFWFIRMWARE:ESP32-C3-RC-IGC-LED-5HZ-PWM-RELALT-OWNER\r\n");
   igcFile.print("HFRHWHARDWARE:ESP32-C3+BN180+SD+BMP180\r\n");
   igcFile.print("HFPLTPILOTINCHARGE:RC\r\n");
   igcFile.print("HFGTYGLIDERTYPE:RCGLIDER\r\n");
@@ -153,7 +179,17 @@ static void writeIgcHeaders() {
   igcFile.flush();
 }
 
-static bool startRecording() {
+static void setBaroBaselineIfPossible() {
+  if (!baroOK) { baroBaseSet = false; return; }
+  float p = bmp180.readPressure(); // Pa
+  baroBaseAlt = pressureAltMetersFromPa(p);
+  baroBaseSet = true;
+  Serial.print("Baro baseline set (pressure altitude): ");
+  Serial.print(baroBaseAlt);
+  Serial.println(" m");
+}
+
+static bool startRecording(RecOwner owner) {
   if (recording) return true;
   if (!sdOK) { Serial.println("START FAIL: SD not OK"); return false; }
   if (!gpsTimeOK()) { Serial.println("START FAIL: GPS time not valid yet"); return false; }
@@ -164,8 +200,14 @@ static bool startRecording() {
   if (!igcFile) { Serial.println("START FAIL: cannot open file"); return false; }
 
   writeIgcHeaders();
+  setBaroBaselineIfPossible();
+
   recording = true;
-  Serial.print("RECORDING STARTED: ");
+  recOwner = owner;
+
+  Serial.print("RECORDING STARTED (owner=");
+  Serial.print(owner == OWNER_PWM ? "PWM" : "BOOT");
+  Serial.print("): ");
   Serial.println(fn);
   return true;
 }
@@ -175,6 +217,8 @@ static void stopRecording() {
   igcFile.flush();
   igcFile.close();
   recording = false;
+  recOwner = OWNER_NONE;
+  baroBaseSet = false;
   Serial.println("RECORDING STOPPED");
 }
 
@@ -193,32 +237,62 @@ static void handleBootToggle() {
     last = cur;
     if (cur) {
       if (recording) stopRecording();
-      else startRecording();
+      else startRecording(OWNER_BOOT);
     }
   }
 }
 
+// ---------------- PWM control ----------------
+static bool readPwmUs(uint16_t &outUs) {
+  uint32_t us = pulseIn(PIN_PWM_IN, HIGH, 25000);
+  if (us < 900 || us > 2200) return false;
+  outUs = (uint16_t)us;
+  return true;
+}
+
+static void handlePwmControl() {
+  uint16_t pwmUs;
+  bool got = readPwmUs(pwmUs);
+
+  if (got) {
+    pwmSeenEver = true;
+    lastPwmOkMs = millis();
+
+    // Hysteresis
+    if (!pwmWantsRec && pwmUs >= PWM_START_US) pwmWantsRec = true;
+    if (pwmWantsRec && pwmUs <= PWM_STOP_US)  pwmWantsRec = false;
+  }
+
+  // If PWM signal lost -> disarm PWM request (but DON'T kill BOOT recordings)
+  if (pwmSeenEver && (millis() - lastPwmOkMs > PWM_TIMEOUT_MS)) {
+    pwmWantsRec = false;
+  }
+
+  // Apply desired state:
+  // PWM can start when requested
+  if (pwmWantsRec && !recording) startRecording(OWNER_PWM);
+
+  // PWM can stop ONLY if PWM started this recording
+  if (!pwmWantsRec && recording && recOwner == OWNER_PWM) stopRecording();
+}
+
 // ---------------- LED ----------------
 static void setLED(bool on) {
-  if (LED_ACTIVE_LOW) {
-    digitalWrite(LED_PIN, on ? LOW : HIGH);
-  } else {
-    digitalWrite(LED_PIN, on ? HIGH : LOW);
-  }
+  if (LED_ACTIVE_LOW) digitalWrite(LED_PIN, on ? LOW : HIGH);
+  else               digitalWrite(LED_PIN, on ? HIGH : LOW);
 }
 
 static void updateLED() {
   uint32_t now = millis();
 
-  // SD missing/error -> ON 1.0s, OFF 0.5s, repeat
+  // SD missing/error -> ON 2s, OFF 2s, repeat
   if (!sdOK) {
     uint32_t phase = now % 4000;
-    bool on = (phase < 2000);
-    setLED(on);
+    setLED(phase < 2000);
     return;
   }
 
-  // Recording -> double blink per second (two short flashes)
+  // Recording -> double blink per second
   if (recording) {
     uint32_t phase = now % 1000;
     bool on = (phase < 100) || (phase > 200 && phase < 300);
@@ -227,10 +301,7 @@ static void updateLED() {
   }
 
   // GPS fix OK -> solid ON
-  if (gpsFixOK()) {
-    setLED(true);
-    return;
-  }
+  if (gpsFixOK()) { setLED(true); return; }
 
   // GPS time OK but no fix -> slow blink (1 Hz)
   if (gpsTimeOK()) {
@@ -260,36 +331,34 @@ void setup() {
 
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
 
-  Serial.println("BOOT LOGGER STARTED (LED active-low fix, 5Hz)");
+  pinMode(PIN_PWM_IN, INPUT);
+  lastPwmOkMs = millis();
 
-  // I2C + BMP180
+  Serial.println("BOOT LOGGER STARTED (5Hz, PWM optional, BOOT always works)");
+
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   baroOK = bmp180.begin();
   Serial.println(baroOK ? "Baro: BMP180 OK" : "Baro: BMP180 NOT FOUND");
 
-  // GPS UART
   GPS.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
   Serial.println("GPS UART started @ 9600");
 
-  // SD
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   sdOK = SD.begin(PIN_SD_CS);
   Serial.println(sdOK ? "SD: OK" : "SD: FAILED");
 
   Serial.println("Press BOOT to start/stop recording.");
+  Serial.println("PWM start>=1600us, stop<=1400us, timeout=500ms (PWM stops only PWM-started recordings)");
 }
 
 void loop() {
-  // Parse GPS stream
   while (GPS.available()) gps.encode(GPS.read());
 
-  // Handle BOOT toggle
   handleBootToggle();
-
-  // Update LED continuously
+  handlePwmControl();
   updateLED();
 
-  // Optional status + altitude debug print every 2s
+  // Status every 2s
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > 2000) {
     lastStatus = millis();
@@ -299,50 +368,44 @@ void loop() {
     Serial.print(" fix=");
     Serial.print(gpsFixOK() ? "OK" : "NO");
 
-    if (gps.satellites.isValid()) {
-      Serial.print(" sats=");
-      Serial.print(gps.satellites.value());
-    } else {
-      Serial.print(" sats=N/A");
-    }
+    Serial.print(" sats=");
+    Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
 
     Serial.print(" baro=");
     Serial.print(baroOK ? "OK" : "NO");
     Serial.print(" sd=");
     Serial.print(sdOK ? "OK" : "NO");
     Serial.print(" recording=");
-    Serial.println(recording ? "YES" : "NO");
+    Serial.print(recording ? "YES" : "NO");
 
-    // ---- Altitude values ----
+    Serial.print(" owner=");
+    Serial.print(recOwner == OWNER_PWM ? "PWM" : (recOwner == OWNER_BOOT ? "BOOT" : "NONE"));
+
+    Serial.print(" pwmRec=");
+    Serial.println(pwmWantsRec ? "YES" : "NO");
+
     float gpsAlt = gps.altitude.isValid() ? gps.altitude.meters() : NAN;
 
-    float baroAlt = NAN;
+    float baroAbsAlt = NAN;
+    float baroRelAlt = NAN;
     if (baroOK) {
-      float p = bmp180.readPressure();      // Pa
-      baroAlt = (float)pressureAltMetersFromPa(p); // meters (QNE/ISA)
+      float p = bmp180.readPressure();
+      baroAbsAlt = (float)pressureAltMetersFromPa(p);
+      if (baroBaseSet) baroRelAlt = baroAbsAlt - (float)baroBaseAlt;
     }
 
-    Serial.print("ALT baro=");
-    if (isfinite(baroAlt)) Serial.print(baroAlt, 1);
-    else Serial.print("N/A");
-
+    Serial.print("ALT baroAbs=");
+    if (isfinite(baroAbsAlt)) Serial.print(baroAbsAlt, 1); else Serial.print("N/A");
+    Serial.print(" m  baroRel=");
+    if (isfinite(baroRelAlt)) Serial.print(baroRelAlt, 1); else Serial.print("N/A");
     Serial.print(" m  gps=");
-    if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1);
-    else Serial.print("N/A");
-
-    if (isfinite(baroAlt) && isfinite(gpsAlt)) {
-      Serial.print(" m  diff=");
-      Serial.print(baroAlt - gpsAlt, 1);
-    }
-
+    if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1); else Serial.print("N/A");
     Serial.println(" m");
   }
 
-
-  // Write IGC B-record at 5 Hz while recording
+  // IGC logging at 5 Hz
   if (recording && millis() - lastLogMs >= LOG_INTERVAL_MS) {
     lastLogMs = millis();
-
     if (!gpsTimeOK() || !gps.location.isValid()) return;
 
     int hh = gps.time.hour();
@@ -357,17 +420,16 @@ void loop() {
 
     int pAlt = gpsAlt;
     if (baroOK) {
-      float p = bmp180.readPressure(); // Pa
-      pAlt = pressureAltMetersFromPa(p);
+      float p = bmp180.readPressure();
+      int absAlt = pressureAltMetersFromPa(p);
+      if (baroBaseSet) pAlt = absAlt - baroBaseAlt; else pAlt = absAlt;
     }
+    if (pAlt < 0) pAlt = 0;
 
     String line = "B" + two(hh) + two(mi) + two(ss) + lat + lon + String(fix)
                 + igcAlt5(pAlt) + igcAlt5(gpsAlt) + "\r\n";
 
     igcFile.print(line);
-
-    // NOTE: flushing at 5 Hz increases SD write load, but is safest.
-    // If you ever get SD glitches, tell me and we’ll flush only once per second.
     igcFile.flush();
   }
 }
