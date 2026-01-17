@@ -1,113 +1,117 @@
-ESP32-C3 RC Glider IGC Logger
+ESP32-C3 IGC Flight Logger (BN-180 + BMP180)
 
-Lightweight IGC flight logger for RC gliders based on ESP32-C3, using a BN-180 GPS, BMP180 barometer, and microSD card.
-Compatible with WeGlide, SeeYou, and other IGC viewers.
+DIY IGC-compatible flight logger based on an ESP32-C3, designed for RC gliders / sailplanes.
+Logs valid IGC B-records with absolute pressure altitude (QNE) and GNSS altitude, compatible with tools like SeeYou, XCSoar, WeGlide, and OLC (unsigned).
 
 ✈️ Features
 
-✅ IGC file output (B-records)
+✅ IGC-compliant B records
 
-✅ 5 Hz logging (200 ms interval)
+✅ Absolute pressure altitude (QNE / ISA 1013.25 hPa) from BMP180
 
-✅ GPS position & altitude
+✅ GNSS altitude from BN-180 (0 if invalid)
 
-✅ Barometric altitude (BMP180)
+✅ Correct fix flag handling (A = valid 3D fix, V = invalid/2D)
 
-✅ microSD storage
+✅ FXA + SIU extensions via I-record
 
-✅ Start/stop recording via BOOT button
+✅ 5 Hz logging (200 ms)
 
-✅ Single on-board LED status
+✅ Start / stop via BOOT button
 
-✅ No WiFi, no BLE, no unnecessary background tasks
+✅ Optional start / stop via RC PWM channel
 
-✅ Designed for long RC flights (2–3+ hours)
+✅ Robust handling of GPS dropouts (repeats last known position)
 
-📦 Hardware Used
+✅ Status LED with clear state patterns
 
-ESP32-C3 Super Mini
+✅ Serial debug output every 2 seconds
 
-BN-180 GPS module
+❌ No AGL in IGC (no LAGL records, by design)
+
+📄 What This Logger Records
+B Record Fields
+
+Each B record contains:
+
+BHHMMSS LAT LON Fix PressAlt GNSSAlt FXA SIU
+
+
+PressAlt
+Absolute pressure altitude (QNE) referenced to 1013.25 hPa
+
+Can be negative
+
+Written as signed 5-character field (e.g. -0045)
+
+GNSSAlt
+GPS altitude above ellipsoid
+
+Written as 00000 if invalid
+
+Fix flag
+
+A → valid 3D fix (lat/lon + altitude + ≥4 satellites)
+
+V → invalid or degraded fix
+
+This matches IGC specification expectations.
+
+🚨 Important Altitude Notes (Very Important)
+
+Pressure altitude is NOT AGL
+
+Negative values near the ground are normal
+
+Example:
+
+Sea-level pressure = 1026 hPa
+
+QNE altitude ≈ −100 m
+
+OLC / WeGlide may display this as negative “AGL”, but that is viewer behavior, not a file error
+
+✔️ Your logger is behaving correctly
+
+🔌 Hardware
+Components
+
+ESP32-C3 (Super Mini / Dev Board)
+
+BN-180 GPS (u-blox)
 
 BMP180 barometric pressure sensor
 
-microSD SPI module
+microSD card module
 
-(optional) external capacitor for power stability
-
-🔌 Wiring Overview
-ESP32-C3 Pin Assignment
-Function	GPIO
-GPS RX	GPIO 20
-GPS TX	GPIO 21
-SD CS	GPIO 10
-SD MOSI	GPIO 7
-SD MISO	GPIO 2
-SD SCK	GPIO 6
-I²C SDA	GPIO 4
-I²C SCL	GPIO 5
-BOOT button	GPIO 9
-On-board LED	GPIO 8
-Power	5V or 3.3V
-Ground	GND
-🛰️ BN-180 GPS
-GPS pin	ESP32-C3
-VCC	5V
+🧷 Pin Wiring
+GPS (BN-180)
+Signal	ESP32-C3 Pin
+TX	GPIO20
+RX	GPIO21
+VCC	5V (or 3.3V, module dependent)
 GND	GND
-TX	GPIO 20
-RX	GPIO 21
-
-GPS module LED indicates fix status (fast blink = no fix, slow blink = fix).
-
-🌡️ BMP180 Barometer (I²C)
-BMP180 pin	ESP32-C3
+Barometer (BMP180 – I²C)
+Signal	ESP32-C3 Pin
+SDA	GPIO4
+SCL	GPIO5
 VCC	3.3V
 GND	GND
-SDA	GPIO 4
-SCL	GPIO 5
-
-⚠️ Do not power BMP180 from 5V
-
-💾 microSD Card (SPI)
-SD pin	ESP32-C3
-CS	GPIO 10
-MOSI	GPIO 7
-MISO	GPIO 2
-SCK	GPIO 6
+microSD (SPI)
+Signal	ESP32-C3 Pin
+CS	GPIO10
+MOSI	GPIO7
+MISO	GPIO2
+SCK	GPIO6
 VCC	3.3V
 GND	GND
-
-⚠️ Use 3.3V-compatible SD modules only
-
-🔋 Powering the Logger (Important)
-
-Recommended:
-
-5V BEC from receiver or
-
-5V step-down from flight battery
-
-Highly recommended:
-
-220–470 µF capacitor between 5V and GND near ESP32
-→ prevents resets during SD writes
-
-🟢 LED Status Overview
-
-The logger uses one on-board LED (active-LOW).
-
-LED pattern	Meaning
-ON 2 s / OFF 2 s	❌ SD card missing or error
-Fast blink (~5 Hz)	GPS time not available yet
-Slow blink (1 Hz)	GPS time OK, no fix
-Solid ON	GPS fix OK (ready)
-Double blink every second	🔴 Recording active
-
-SD error overrides all other states.
-
-🔘 Recording Control
-
-Use the BOOT button on the ESP32-C3
+Controls
+Function	Pin
+BOOT button	GPIO9
+Optional PWM input	GPIO3
+Status LED	GPIO8 (active-LOW)
+🎮 Start / Stop Recording
+BOOT Button
 
 Short press:
 
@@ -115,40 +119,56 @@ Short press:
 
 ⏹ Stop recording
 
-Files are written to:
+Each start creates a new IGC file
 
-/IGC/YYYYMMDD_HHMMSS.IGC
+PWM Control (Optional)
 
-📈 Logging Details
+≥1600 µs → start recording
 
-Log rate: 5 Hz (200 ms)
+≤1400 µs → stop recording
 
-Logged data (IGC B-records):
+Timeout: if PWM signal disappears for 500 ms, recording stops only if PWM started it
 
-UTC time
+Use a single servo cable:
 
-Latitude / Longitude
+Red → 5V
 
-Fix validity
+Black/Brown → GND
 
-Barometric altitude
+White/Yellow → PWM signal
 
-GPS altitude
+💡 LED Status Patterns
+State	LED
+SD missing / error	ON 2s / OFF 2s
+GPS time not valid	Fast blink (~5 Hz)
+GPS time OK, no fix	Slow blink (1 Hz)
+GPS fix OK (ready)	Solid ON
+Recording active	Double blink per second
+🖥 Serial Debug Output
 
-Ground speed, climb, glide ratio, etc. are calculated by WeGlide from position changes.
+Printed every 2 seconds at 115200 baud:
 
-🧪 Serial Debug Output
+GPS time=OK fix=OK sats=8 baro=OK sd=OK recording=YES owner=BOOT
+ALT baroQNE=-48.0 m  gps=53.2 m
 
-Via USB serial @ 115200 baud:
 
-GPS time / fix / satellites
+Useful for:
 
-SD & baro status
+Verifying GPS fix quality
 
-Recording state
+Checking pressure altitude behavior
 
-Baro altitude
+Confirming SD card health
 
-GPS altitude
+📂 SD Card Output
 
-Altitude difference
+Files stored in /IGC/
+
+Filename format:
+
+YYYYMMDD_HHMMSS.IGC
+
+
+New file every time recording starts
+
+No power-cycle required
