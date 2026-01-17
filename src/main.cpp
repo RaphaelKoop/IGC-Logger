@@ -1,35 +1,27 @@
 // src/main.cpp
-// ESP32-C3 IGC Logger (NO WiFi) + On-board LED status (ACTIVE-LOW)
-// - BN-180 GPS (UART)
-// - BMP180 baro (I2C)
-// - microSD (SPI)
-// - Start/stop recording with BOOT button
-// - Start/stop recording with RC receiver PWM channel (optional)
+// ESP32-C3 IGC Logger (BN-180 GPS + BMP180 + microSD)
+// - BOOT button start/stop
+// - RC PWM start/stop (optional)
+// - IGC formatting aligned to spec:
+//   * A record: A + 3-char manufacturer + 3-char unique ID
+//   * H records incl. HFFXA
+//   * I record defines FXA + SIU extensions
+//   * B record: BHHMMSS LAT LON AV PPPPP GGGGG + FXA(3) + SIU(2)
+// - NO "LAGLxxxxx" records (removed)
+// - Pressure altitude = ISA/QNE 1013.25 hPa from BMP180 (signed 5 chars)
+// - GNSS altitude = GNSS height (meters), 00000 if invalid/2D
 //
-// LOG RATE: 5 Hz (B-record every 200 ms)
+// LOG RATE: 5 Hz (200 ms)
+// SD: write at 5 Hz, flush once per second
 //
-// IGC FIX (B) RECORDS — IMPORTANT (per IGC spec behavior):
-// - Pressure altitude field = ABSOLUTE pressure altitude referenced to ISA/QNE 1013.25 hPa (NOT AGL).
-//   -> Can be negative (and must be written with '-' in the 5-char field).
-// - GNSS altitude field = GPS altitude above ellipsoid.
-//   -> If GNSS altitude is not valid, write 00000.
-// - Fix validity flag:
-//   -> 'A' only when we have a proper 3D fix (lat/lon valid and fresh, sats>=4, plus altitude valid).
-//   -> Otherwise 'V'.
-//
-// AGL:
-// - We still compute AGL (relative to baro baseline at start) and write it as an extra L record: "LAGLxxxxx".
-// - AGL is clamped to >= 0 (so you will not get negative AGL anymore).
-//
-// SD:
-// - Writes at 5 Hz, flush once per second.
-//
-// LED patterns (single LED):
+// LED patterns (single LED, ACTIVE-LOW):
 // - SD missing/error:   ON 2s, OFF 2s, repeat
 // - GPS time NOT OK:    fast blink (~5 Hz)
 // - GPS time OK no fix: slow blink (1 Hz)
 // - GPS fix OK:         solid ON (ready)
 // - RECORDING active:   double blink per second
+//
+// Serial status: every 2s prints time/fix/sats/baro/sd/recording/owner/pwm + altitude debug
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -37,8 +29,10 @@
 #include <SD.h>
 #include <TinyGPSPlus.h>
 #include <Adafruit_BMP085.h>
-#include <WiFi.h>   // for MAC read (no WiFi used)
+#include <esp_system.h>
+#include <esp_mac.h>
 
+// ---------------- Pins ----------------
 static const int PIN_GPS_RX = 20;   // ESP RX  <- GPS TX
 static const int PIN_GPS_TX = 21;   // ESP TX  -> GPS RX
 
@@ -52,86 +46,74 @@ static const int PIN_I2C_SCL = 5;
 
 static const int PIN_BOOT_BTN = 9;
 
-// RC PWM input pin (optional)
-static const int PIN_PWM_IN = 3;
-
-// Built-in LED pin
-static const int LED_PIN = 8;
-static const bool LED_ACTIVE_LOW = true;
-
-// PWM thresholds
+// Optional PWM input (set to -1 to disable)
+static const int PIN_PWM_IN = 3;       // set to -1 to disable
 static const int PWM_START_US = 1600;
 static const int PWM_STOP_US  = 1400;
 static const uint32_t PWM_TIMEOUT_MS = 500;
 
-// Logging
+// Built-in LED
+static const int LED_PIN = 8;
+static const bool LED_ACTIVE_LOW = true;
+
+// ---------------- Logging ----------------
 static const uint32_t LOG_INTERVAL_MS = 200; // 5 Hz
 static const uint32_t SD_FLUSH_MS     = 1000;
 
-// Baro baseline averaging (for AGL only)
-static const int BARO_BASE_SAMPLES = 20;
-static const int BARO_SAMPLE_DELAY_MS = 20;
-
-// If GPS has no location yet, we still log B records using last known coords.
-// If we have never had a coord, use 0/0 (still marked V).
-static const double FALLBACK_LAT = 0.0;
-static const double FALLBACK_LON = 0.0;
-
-// Device ID
-static const char* IGC_A_RECORD       = "AESP32C3";          // A record line (your own)
-static const char* LOGGER_NAME        = "ESP32-C3-RC-IGC";
-static const char* LOGGER_VERSION     = "5HZ-PWM-QNE-ABSALT";
-
-// Globals
+// ---------------- Globals ----------------
 HardwareSerial GPS(1);
 TinyGPSPlus gps;
+
 Adafruit_BMP085 bmp180;
-
 bool baroOK = false;
-bool sdOK = false;
 
+bool sdOK = false;
 bool recording = false;
 File igcFile;
 
 uint32_t lastLogMs = 0;
 uint32_t lastFlushMs = 0;
 
-// LED blink state
-uint32_t lastLedToggle = 0;
-bool ledState = false;
+// Owner
+enum Owner : uint8_t { OWNER_NONE = 0, OWNER_BOOT = 1, OWNER_PWM = 2 };
+Owner recOwner = OWNER_NONE;
 
 // PWM state
 bool pwmWantsRec = false;
 bool pwmSeenEver = false;
 uint32_t lastPwmOkMs = 0;
 
-// Owner
-enum RecOwner : uint8_t { OWNER_NONE = 0, OWNER_BOOT = 1, OWNER_PWM = 2 };
-RecOwner recOwner = OWNER_NONE;
+// LED blink state (for non-recording blinking)
+uint32_t lastLedToggle = 0;
+bool ledState = false;
 
-// Baro baseline for AGL (computed from ABS QNE pressure altitude, but only used for LAGL)
-bool baroBaseSet = false;
-int  baroBaseAbsQneAltM = 0;
+// last known position strings (for brief invalid periods)
+String lastLatStr = "0000000N";
+String lastLonStr = "00000000E";
 
-// Last known GPS position (for repeating when GPS drops, per spec guidance)
-bool   haveLastPos = false;
-double lastLat = FALLBACK_LAT;
-double lastLon = FALLBACK_LON;
-
-// ---- Helpers ----
+// ---------------- Helpers ----------------
 static String two(int v) { return (v < 10) ? "0" + String(v) : String(v); }
 
-static bool gpsTimeOK() { return gps.time.isValid() && gps.date.isValid(); }
+static void setLED(bool on) {
+  if (LED_ACTIVE_LOW) digitalWrite(LED_PIN, on ? LOW : HIGH);
+  else digitalWrite(LED_PIN, on ? HIGH : LOW);
+}
 
-// “Proper” fix for our purposes: location valid + fresh + sats>=4
+static bool gpsTimeOK() {
+  return gps.time.isValid() && gps.date.isValid();
+}
+
+// “Proper” fix: location valid + fresh + sats>=4 + altitude valid (3D)
 static bool gpsFixOK() {
   if (!gps.location.isValid()) return false;
   if (gps.location.age() > 3000) return false;
   if (gps.satellites.isValid() && gps.satellites.value() < 4) return false;
+  if (!gps.altitude.isValid()) return false;
+  if (gps.altitude.age() > 3000) return false;
   return true;
 }
 
-// Pressure altitude in meters, referenced to ISA sea level 1013.25 hPa (QNE)
+// ISA pressure altitude from pressure in Pa (QNE 1013.25)
 static int pressureAltMetersFromPa(float pressurePa) {
   if (!isfinite(pressurePa) || pressurePa <= 0) return 0;
   float p_hPa = pressurePa / 100.0f;
@@ -139,7 +121,7 @@ static int pressureAltMetersFromPa(float pressurePa) {
   return (int)lroundf(alt);
 }
 
-// IGC coord formatting: DDMMmmmN / DDDMMmmmE
+// IGC coord formatting: DDMMmmmN / DDDMMmmmE (thousandths of minutes)
 static String igcLat(double lat) {
   char hemi = (lat >= 0) ? 'N' : 'S';
   lat = fabs(lat);
@@ -172,28 +154,22 @@ static String igcLon(double lon) {
   return String(buf);
 }
 
-// IGC altitude field (5 chars)
-// Positive: "00123"
-// Negative: "-0123"   (minus sign replaces the leading zero; total length stays 5)
-static String igcAlt5Signed(int meters) {
-  if (meters > 99999) meters = 99999;
-  if (meters < -9999) meters = -9999; // because "-9999" is 5 chars including '-'
-
-  char buf[8];
-  if (meters >= 0) {
-    snprintf(buf, sizeof(buf), "%05d", meters);
-  } else {
-    snprintf(buf, sizeof(buf), "-%04d", abs(meters));
-  }
-  return String(buf);
-}
-
-// AGL as a 5-digit clamped non-negative (for L record only)
+// GNSS altitude field: 5 digits, digits only. If invalid -> 00000.
 static String igcAlt5Unsigned(int meters) {
   if (meters < 0) meters = 0;
   if (meters > 99999) meters = 99999;
   char buf[8];
   snprintf(buf, sizeof(buf), "%05d", meters);
+  return String(buf);
+}
+
+// Pressure altitude field: 5 chars, may be signed: "-0123" or "00123"
+static String igcAlt5Signed(int meters) {
+  if (meters > 99999) meters = 99999;
+  if (meters < -9999) meters = -9999; // "-9999" is 5 chars
+  char buf[8];
+  if (meters < 0) snprintf(buf, sizeof(buf), "-%04d", abs(meters));
+  else           snprintf(buf, sizeof(buf), "%05d", meters);
   return String(buf);
 }
 
@@ -210,6 +186,19 @@ static String makeIgcFilenameUTC() {
   return String(buf);
 }
 
+// 3-char unique ID from MAC last 24 bits (base36)
+static String make3CharId() {
+  uint64_t mac = ESP.getEfuseMac();
+  uint32_t x = (uint32_t)(mac & 0xFFFFFF);
+  const char *abc = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  char out[4];
+  out[0] = abc[(x / (36 * 36)) % 36];
+  out[1] = abc[(x / 36) % 36];
+  out[2] = abc[x % 36];
+  out[3] = 0;
+  return String(out);
+}
+
 static String macNoColonsLower() {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -224,95 +213,59 @@ static void writeIgcHeaders() {
   int mm = gps.date.month();
   int yy = gps.date.year() % 100;
 
-  // A record
-  igcFile.print(IGC_A_RECORD);
-  igcFile.print("\r\n");
+  // A record: A + MMM + NNN (use XXX if no manufacturer code)
+  String id3 = make3CharId();
+  igcFile.print("AXXX");
+  igcFile.print(id3);
+  igcFile.print("FLIGHT:1\r\n");
 
-  // Required-ish header lines (kept simple but correct format)
+  // Required-ish headers
   igcFile.printf("HFDTE%02d%02d%02d\r\n", dd, mm, yy);
+  igcFile.print("HFFXA050\r\n"); // typical fix accuracy category (meters)
   igcFile.print("HFDTM100GPSDATUM:WGS-1984\r\n");
 
-  igcFile.print("HFRFWFIRMWAREVERSION:");
-  igcFile.print(LOGGER_NAME);
-  igcFile.print("-");
-  igcFile.print(LOGGER_VERSION);
-  igcFile.print("\r\n");
-
+  igcFile.print("HFRFWFIRMWAREVERSION:ESP32-C3-RC-IGC-5HZ-PWM-FXA-SIU\r\n");
   igcFile.print("HFRHWHARDWAREVERSION:ESP32-C3+BN180+SD+BMP180\r\n");
+  igcFile.print("HFFTYFRTYPE:XXX,ESP32C3-LOGGER\r\n");
+  igcFile.print("HFGPS:u-blox,BN-180\r\n");
+  igcFile.print("HFPRSPRESSALTSENSOR:BMP180\r\n");
 
-  igcFile.print("HFFTYFRTYPE:DIY,");
-  igcFile.print(LOGGER_NAME);
-  igcFile.print("\r\n");
-
-  igcFile.print("HFGIDGLIDERID:N/A\r\n");
   igcFile.print("HFPLTPILOTINCHARGE:RC\r\n");
   igcFile.print("HFGTYGLIDERTYPE:RCGLIDER\r\n");
-  igcFile.print("HFCIDCOMPETITIONID:RC\r\n");
-  igcFile.print("HFCCLCOMPETITIONCLASS:RC\r\n");
-
-  igcFile.print("HFGPS:BN-180 (u-blox)\r\n");
-  igcFile.print("HFPRSPRESSALTSENSOR:BMP180\r\n");
+  igcFile.print("HFGIDGLIDERID:N/A\r\n");
 
   igcFile.print("HFGIDLOGGERID:");
   igcFile.print(macNoColonsLower());
   igcFile.print("\r\n");
 
+  // I record: FXA (36-38), SIU (39-40)
+  igcFile.print("I023638FXA3940SIU\r\n");
+
   igcFile.flush();
 }
 
-// Establish baseline for AGL only (average ABS QNE pressure altitude)
-static void setBaroBaselineIfPossible() {
-  baroBaseSet = false;
-  if (!baroOK) return;
-
-  long sum = 0;
-  int n = 0;
-
-  for (int i = 0; i < BARO_BASE_SAMPLES; i++) {
-    float p = bmp180.readPressure();
-    if (isfinite(p) && p > 0) {
-      sum += pressureAltMetersFromPa(p);
-      n++;
-    }
-    delay(BARO_SAMPLE_DELAY_MS);
-  }
-
-  if (n <= 0) return;
-
-  baroBaseAbsQneAltM = (int)lround((double)sum / (double)n);
-  baroBaseSet = true;
-
-  Serial.print("Baro baseline set (avg ");
-  Serial.print(n);
-  Serial.print(" samples): ");
-  Serial.print(baroBaseAbsQneAltM);
-  Serial.println(" m (QNE)");
-}
-
-static bool startRecording(RecOwner owner) {
+static bool startRecording(Owner owner) {
   if (recording) return true;
   if (!sdOK) { Serial.println("START FAIL: SD not OK"); return false; }
-  if (!gpsTimeOK()) { Serial.println("START FAIL: GPS time/date not valid yet"); return false; }
+  if (!gpsTimeOK()) { Serial.println("START FAIL: GPS time not valid yet"); return false; }
 
   ensureDir("/IGC");
   String fn = makeIgcFilenameUTC();
   igcFile = SD.open(fn.c_str(), FILE_WRITE);
   if (!igcFile) { Serial.println("START FAIL: cannot open file"); return false; }
 
-  // Reset “last known” values for this flight
-  haveLastPos = false;
-  lastLat = FALLBACK_LAT;
-  lastLon = FALLBACK_LON;
+  // reset last-known position placeholders for this file
+  lastLatStr = "0000000N";
+  lastLonStr = "00000000E";
 
   writeIgcHeaders();
-  setBaroBaselineIfPossible(); // only affects LAGL output
 
   recording = true;
   recOwner = owner;
   lastFlushMs = millis();
 
   Serial.print("RECORDING STARTED (owner=");
-  Serial.print(owner == OWNER_PWM ? "PWM" : "BOOT");
+  Serial.print(owner == OWNER_BOOT ? "BOOT" : (owner == OWNER_PWM ? "PWM" : "NONE"));
   Serial.print("): ");
   Serial.println(fn);
   return true;
@@ -324,11 +277,10 @@ static void stopRecording() {
   igcFile.close();
   recording = false;
   recOwner = OWNER_NONE;
-  baroBaseSet = false;
   Serial.println("RECORDING STOPPED");
 }
 
-// BOOT debounce/toggle (active LOW)
+// BOOT button debounce/toggle (active LOW)
 static bool bootPressed() { return digitalRead(PIN_BOOT_BTN) == LOW; }
 
 static void handleBootToggle() {
@@ -348,15 +300,18 @@ static void handleBootToggle() {
   }
 }
 
-// PWM
+// PWM input (optional)
 static bool readPwmUs(uint16_t &outUs) {
-  uint32_t us = pulseIn(PIN_PWM_IN, HIGH, 25000);
+  if (PIN_PWM_IN < 0) return false;
+  uint32_t us = pulseIn(PIN_PWM_IN, HIGH, 25000); // 25ms
   if (us < 900 || us > 2200) return false;
   outUs = (uint16_t)us;
   return true;
 }
 
 static void handlePwmControl() {
+  if (PIN_PWM_IN < 0) return;
+
   uint16_t pwmUs;
   bool got = readPwmUs(pwmUs);
 
@@ -376,21 +331,18 @@ static void handlePwmControl() {
   if (!pwmWantsRec && recording && recOwner == OWNER_PWM) stopRecording();
 }
 
-// LED
-static void setLED(bool on) {
-  if (LED_ACTIVE_LOW) digitalWrite(LED_PIN, on ? LOW : HIGH);
-  else               digitalWrite(LED_PIN, on ? HIGH : LOW);
-}
-
+// LED logic (from your older working version)
 static void updateLED() {
   uint32_t now = millis();
 
+  // SD missing/error: ON 2s OFF 2s
   if (!sdOK) {
     uint32_t phase = now % 4000;
     setLED(phase < 2000);
     return;
   }
 
+  // RECORDING active: double blink per second
   if (recording) {
     uint32_t phase = now % 1000;
     bool on = (phase < 100) || (phase > 200 && phase < 300);
@@ -398,8 +350,13 @@ static void updateLED() {
     return;
   }
 
-  if (gpsFixOK()) { setLED(true); return; }
+  // GPS fix OK (ready): solid on
+  if (gpsFixOK()) {
+    setLED(true);
+    return;
+  }
 
+  // GPS time OK, but no fix: slow blink 1 Hz (toggle every 500ms)
   if (gpsTimeOK()) {
     if (now - lastLedToggle > 500) {
       lastLedToggle = now;
@@ -409,6 +366,7 @@ static void updateLED() {
     return;
   }
 
+  // GPS time NOT OK: fast blink (~5 Hz) (toggle every 100ms)
   if (now - lastLedToggle > 100) {
     lastLedToggle = now;
     ledState = !ledState;
@@ -416,6 +374,7 @@ static void updateLED() {
   }
 }
 
+// ---------------- Arduino ----------------
 void setup() {
   Serial.begin(115200);
   delay(1500);
@@ -424,41 +383,40 @@ void setup() {
   setLED(false);
 
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
-  pinMode(PIN_PWM_IN, INPUT);
+  if (PIN_PWM_IN >= 0) pinMode(PIN_PWM_IN, INPUT);
   lastPwmOkMs = millis();
 
-  Serial.println("BOOT LOGGER STARTED (5Hz, ABS QNE press-alt in B, GNSS alt 00000 if invalid, AGL in L record)");
+  Serial.println("ESP32-C3 IGC LOGGER STARTED (5Hz, FXA+SIU, NO LAGL, QNE press-alt, GNSS alt 00000 if invalid)");
+  Serial.println("LED: SD err 2s/2s, time NO fast, time OK no fix slow, fix OK solid, recording double blink");
 
+  // I2C + BMP180
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   baroOK = bmp180.begin();
   Serial.println(baroOK ? "Baro: BMP180 OK" : "Baro: BMP180 NOT FOUND");
 
+  // GPS UART
   GPS.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
   Serial.println("GPS UART started @ 9600");
 
+  // SD
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   sdOK = SD.begin(PIN_SD_CS);
   Serial.println(sdOK ? "SD: OK" : "SD: FAILED");
 
   Serial.println("Press BOOT to start/stop recording.");
-  Serial.println("PWM start>=1600us, stop<=1400us, timeout=500ms (PWM stops only PWM-started recordings)");
+  if (PIN_PWM_IN >= 0) {
+    Serial.println("PWM start>=1600us, stop<=1400us, timeout=500ms (PWM stops only PWM-started recordings)");
+  }
 }
 
 void loop() {
   while (GPS.available()) gps.encode(GPS.read());
 
-  // Update last known position if we have one (fresh)
-  if (gps.location.isValid() && gps.location.age() <= 3000) {
-    lastLat = gps.location.lat();
-    lastLon = gps.location.lng();
-    haveLastPos = true;
-  }
-
   handleBootToggle();
   handlePwmControl();
   updateLED();
 
-  // Status every 2s
+  // Serial status every 2s (from your older version)
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > 2000) {
     lastStatus = millis();
@@ -485,92 +443,90 @@ void loop() {
 
     // Debug altitude readouts
     float baroQne = NAN;
-    float agl = NAN;
     if (baroOK) {
       float p = bmp180.readPressure();
       int absQne = pressureAltMetersFromPa(p);
       baroQne = (float)absQne;
-      if (baroBaseSet) {
-        int rel = absQne - baroBaseAbsQneAltM;
-        if (rel < 0) rel = 0;
-        agl = (float)rel;
-      }
     }
-
-    float gpsAlt = (gpsFixOK() && gps.altitude.isValid()) ? gps.altitude.meters() : NAN;
+    float gpsAlt = (gps.altitude.isValid() && gps.altitude.age() <= 3000) ? gps.altitude.meters() : NAN;
 
     Serial.print("ALT baroQNE=");
     if (isfinite(baroQne)) Serial.print(baroQne, 1); else Serial.print("N/A");
-    Serial.print(" m  baroAGL=");
-    if (isfinite(agl)) Serial.print(agl, 1); else Serial.print("N/A");
     Serial.print(" m  gps=");
     if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1); else Serial.print("N/A");
     Serial.println(" m");
   }
 
-  // IGC logging at 5 Hz
-  if (recording && millis() - lastLogMs >= LOG_INTERVAL_MS) {
+  // Write IGC B-record at 5 Hz while recording
+  if (recording && (millis() - lastLogMs >= LOG_INTERVAL_MS)) {
     lastLogMs = millis();
 
-    // Need GPS time to build B-record time field
+    // Need GPS time to timestamp records
     if (!gpsTimeOK()) return;
 
     int hh = gps.time.hour();
     int mi = gps.time.minute();
     int ss = gps.time.second();
 
-    // Repeat last known position if current invalid/missing (spec-style behavior)
-    double useLat = haveLastPos ? lastLat : FALLBACK_LAT;
-    double useLon = haveLastPos ? lastLon : FALLBACK_LON;
+    // Fix validity: A = 3D with altitude valid, V otherwise
+    char fix = gpsFixOK() ? 'A' : 'V';
 
-    String lat = igcLat(useLat);
-    String lon = igcLon(useLon);
+    // Position: if current invalid, repeat last known (spec guidance)
+    String latStr = lastLatStr;
+    String lonStr = lastLonStr;
+    if (gps.location.isValid() && gps.location.age() <= 3000) {
+      latStr = igcLat(gps.location.lat());
+      lonStr = igcLon(gps.location.lng());
+      lastLatStr = latStr;
+      lastLonStr = lonStr;
+    }
 
-    // Determine GNSS altitude validity
-    bool gnssAltValid = (gpsFixOK() && gps.altitude.isValid());
+    // GNSS altitude: 00000 if invalid
+    int gnssAltM = (gpsFixOK() && gps.altitude.isValid() && gps.altitude.age() <= 3000)
+                     ? (int)lround(gps.altitude.meters())
+                     : 0;
+    if (gnssAltM < 0) gnssAltM = 0;
+    if (gnssAltM > 99999) gnssAltM = 99999;
 
-    // Fix flag: only 'A' if we consider it a proper 3D fix AND GNSS altitude valid
-    char fix = (gpsFixOK() && gnssAltValid) ? 'A' : 'V';
-
-    // Pressure altitude (ABS QNE) — must be absolute ISA/QNE 1013.25, can be negative, no clamping
-    int pressAltQne = 0;
-    bool pressAltValid = false;
+    // Pressure altitude (QNE/ISA) from baro: if baro missing, use 0
+    int pAltM = 0;
     if (baroOK) {
-      float p = bmp180.readPressure();
-      if (isfinite(p) && p > 0) {
-        pressAltQne = pressureAltMetersFromPa(p);
-        pressAltValid = true;
-      }
-    }
-    if (!pressAltValid) pressAltQne = 0; // if no sensor, write 00000
-
-    // GNSS altitude: if not valid, write 00000 (per spec guidance)
-    int gnssAlt = 0;
-    if (gnssAltValid) {
-      gnssAlt = (int)lround(gps.altitude.meters());
-      if (gnssAlt < 0) gnssAlt = 0;      // you *can* allow negative, but 0 makes invalid obvious near sea level
-      if (gnssAlt > 99999) gnssAlt = 99999;
-    } else {
-      gnssAlt = 0;
+      float p = bmp180.readPressure(); // Pa
+      pAltM = pressureAltMetersFromPa(p);
     }
 
-    // Build B record:
-    // BHHMMSS + LAT(8) + LON(9) + Fix(1) + PressAlt(5) + GnssAlt(5)
-    String line = "B" + two(hh) + two(mi) + two(ss) + lat + lon + String(fix)
-                + igcAlt5Signed(pressAltQne)
-                + igcAlt5Unsigned(gnssAlt)
+    // FXA (Estimated Position Error): rough mapping from HDOP
+    int fxa = 50;
+    if (gps.hdop.isValid()) {
+      double hdop = gps.hdop.hdop();
+      int epe = (int)lround(hdop * 5.0);
+      if (epe < 5) epe = 5;
+      if (epe > 999) epe = 999;
+      fxa = epe;
+    }
+    char fxaBuf[4];
+    snprintf(fxaBuf, sizeof(fxaBuf), "%03d", fxa);
+
+    // SIU (satellites in use)
+    int siu = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    if (siu < 0) siu = 0;
+    if (siu > 99) siu = 99;
+    char siuBuf[3];
+    snprintf(siuBuf, sizeof(siuBuf), "%02d", siu);
+
+    // B record (no spaces):
+    // BHHMMSS + LAT(8) + LON(9) + AV(1) + PPPPP(5 signed) + GGGGG(5) + FXA(3) + SIU(2)
+    String line = "B" + two(hh) + two(mi) + two(ss)
+                + latStr + lonStr + String(fix)
+                + igcAlt5Signed(pAltM)
+                + igcAlt5Unsigned(gnssAltM)
+                + String(fxaBuf)
+                + String(siuBuf)
                 + "\r\n";
+
     igcFile.print(line);
 
-    // Also write AGL as custom L-record (always >=0)
-    if (pressAltValid && baroBaseSet) {
-      int aglM = pressAltQne - baroBaseAbsQneAltM;
-      if (aglM < 0) aglM = 0;
-      igcFile.print("LAGL");
-      igcFile.print(igcAlt5Unsigned(aglM));
-      igcFile.print("\r\n");
-    }
-
+    // Flush once per second
     uint32_t now = millis();
     if (now - lastFlushMs >= SD_FLUSH_MS) {
       lastFlushMs = now;
