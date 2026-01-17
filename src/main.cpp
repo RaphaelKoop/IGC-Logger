@@ -13,9 +13,11 @@
 // - If GPS fix drops, we KEEP logging B-records with fix flag 'V'.
 // - If position is missing, we reuse last known lat/lon (still 'V').
 //
-// BARO altitude:
-// - "Pressure altitude" field logs RELATIVE baro altitude vs start baseline (AGL-style).
-// - Baseline is averaged once at start and then fixed for the flight.
+// BARO altitude / OLC compatibility (IMPORTANT):
+// - IGC "pressure altitude" field now logs ABSOLUTE pressure altitude (QNE, 1013.25 hPa).
+//   This value may be negative near sea level on high-pressure days, and that's OK.
+// - We write pressure altitude with SIGN (e.g. -0045) to avoid clamping to 00000.
+// - We optionally add an L-record "AGL" altitude relative to the start baseline (clamped >=0).
 //
 // SD:
 // - Writes at 5 Hz, flush once per second.
@@ -64,7 +66,7 @@ static const uint32_t PWM_TIMEOUT_MS = 500;
 static const uint32_t LOG_INTERVAL_MS = 200; // 5 Hz
 static const uint32_t SD_FLUSH_MS     = 1000;
 
-// Baro baseline averaging
+// Baro baseline averaging (for AGL L-record only)
 static const int BARO_BASE_SAMPLES = 10;
 static const int BARO_SAMPLE_DELAY_MS = 20;
 
@@ -73,10 +75,10 @@ static const int BARO_SAMPLE_DELAY_MS = 20;
 static const double FALLBACK_LAT = 0.0;
 static const double FALLBACK_LON = 0.0;
 
-// Device ID
-static const char* IGC_MANUFACTURER_ID = "AESP32C3";     // 7 chars incl 'A' is fine
+// Device ID / description
+static const char* IGC_MANUFACTURER_ID = "AESP32C3";
 static const char* LOGGER_NAME         = "ESP32-C3-RC-IGC";
-static const char* LOGGER_VERSION      = "5HZ-PWM-RELALT-AVG-VREC";
+static const char* LOGGER_VERSION      = "5HZ-PWM-QNE-SIGNED-VREC";
 
 // Globals
 HardwareSerial GPS(1);
@@ -105,9 +107,9 @@ uint32_t lastPwmOkMs = 0;
 enum RecOwner : uint8_t { OWNER_NONE = 0, OWNER_BOOT = 1, OWNER_PWM = 2 };
 RecOwner recOwner = OWNER_NONE;
 
-// Baro baseline
+// Baro baseline (for AGL reference only)
 bool baroBaseSet = false;
-int  baroBaseAlt = 0;
+int  baroBaseAlt = 0;  // absolute pressure altitude at start (QNE)
 
 // Last known GPS data to survive dropouts
 bool   haveLastPos = false;
@@ -127,6 +129,7 @@ static bool gpsFixOK() {
   return true;
 }
 
+// Pressure altitude from pressure in Pa (ISA/QNE, 1013.25 hPa)
 static int pressureAltMetersFromPa(float pressurePa) {
   if (!isfinite(pressurePa) || pressurePa <= 0) return 0;
   float p_hPa = pressurePa / 100.0f;
@@ -167,7 +170,19 @@ static String igcLon(double lon) {
   return String(buf);
 }
 
-static String igcAlt5(int meters) {
+// Signed 5-char altitude for PRESSURE altitude (QNE). Examples: 00123, -0045
+static String igcAlt5Signed(int meters) {
+  if (meters > 99999) meters = 99999;
+  if (meters < -9999) meters = -9999; // "-9999" is 5 chars
+
+  char buf[8];
+  if (meters < 0) snprintf(buf, sizeof(buf), "-%04d", -meters);
+  else           snprintf(buf, sizeof(buf), "%05d", meters);
+  return String(buf);
+}
+
+// Unsigned 5-char altitude for GPS altitude. Negative/invalid -> 00000
+static String igcAlt5Unsigned(int meters) {
   if (meters < 0) meters = 0;
   if (meters > 99999) meters = 99999;
   char buf[8];
@@ -180,12 +195,23 @@ static bool ensureDir(const char *path) {
   return SD.mkdir(path);
 }
 
+// Unique filename even if multiple starts in same second
 static String makeIgcFilenameUTC() {
-  char buf[48];
-  snprintf(buf, sizeof(buf), "/IGC/%04d%02d%02d_%02d%02d%02d.IGC",
+  char base[48];
+  snprintf(base, sizeof(base), "/IGC/%04d%02d%02d_%02d%02d%02d",
            gps.date.year(), gps.date.month(), gps.date.day(),
            gps.time.hour(), gps.time.minute(), gps.time.second());
-  return String(buf);
+
+  String fn = String(base) + ".IGC";
+  if (!SD.exists(fn.c_str())) return fn;
+
+  for (int i = 1; i <= 99; i++) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s_%02d.IGC", base, i);
+    if (!SD.exists(buf)) return String(buf);
+  }
+
+  return String(base) + "_XX.IGC";
 }
 
 static String macNoColonsLower() {
@@ -202,17 +228,12 @@ static void writeIgcHeaders() {
   int mm = gps.date.month();
   int yy = gps.date.year() % 100;
 
-  // A record (manufacturer/logger id)
   igcFile.print(IGC_MANUFACTURER_ID);
   igcFile.print("\r\n");
 
-  // Date
   igcFile.printf("HFDTE%02d%02d%02d\r\n", dd, mm, yy);
-
-  // Datum
   igcFile.print("HFDTM100GPSDATUM:WGS-1984\r\n");
 
-  // Firmware / hardware / id
   igcFile.print("HFRFWFIRMWARE:");
   igcFile.print(LOGGER_NAME);
   igcFile.print("-");
@@ -221,18 +242,13 @@ static void writeIgcHeaders() {
 
   igcFile.print("HFRHWHARDWARE:ESP32-C3+BN180+SD+BMP180\r\n");
 
-  // Device ID (use MAC)
   igcFile.print("HFGIDLOGGERID:");
   igcFile.print(macNoColonsLower());
   igcFile.print("\r\n");
 
-  // GPS type
   igcFile.print("HFGPS:BN-180 (u-blox)\r\n");
-
-  // Pressure sensor
   igcFile.print("HFPRS:BMP180\r\n");
 
-  // Pilot / glider fields (harmless defaults)
   igcFile.print("HFPLTPILOTINCHARGE:RC\r\n");
   igcFile.print("HFGTYGLIDERTYPE:RCGLIDER\r\n");
   igcFile.print("HFGIDGLIDERID:N/A\r\n");
@@ -264,7 +280,7 @@ static void setBaroBaselineIfPossible() {
   Serial.print(n);
   Serial.print(" samples): ");
   Serial.print(baroBaseAlt);
-  Serial.println(" m");
+  Serial.println(" m (QNE)");
 }
 
 static bool startRecording(RecOwner owner) {
@@ -277,7 +293,6 @@ static bool startRecording(RecOwner owner) {
   igcFile = SD.open(fn.c_str(), FILE_WRITE);
   if (!igcFile) { Serial.println("START FAIL: cannot open file"); return false; }
 
-  // Reset last-known values for this flight
   haveLastPos = false;
   lastLat = FALLBACK_LAT;
   lastLon = FALLBACK_LON;
@@ -406,7 +421,7 @@ void setup() {
   pinMode(PIN_PWM_IN, INPUT);
   lastPwmOkMs = millis();
 
-  Serial.println("BOOT LOGGER STARTED (5Hz, V-records on dropout, extra H-lines)");
+  Serial.println("BOOT LOGGER STARTED (5Hz, QNE signed pressure alt, V-record dropouts)");
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   baroOK = bmp180.begin();
@@ -465,6 +480,7 @@ void loop() {
     Serial.print(" pwmRec=");
     Serial.println(pwmWantsRec ? "YES" : "NO");
 
+    // Debug altitudes
     float gpsAlt = gps.altitude.isValid() ? gps.altitude.meters() : NAN;
 
     float baroAbsAlt = NAN;
@@ -474,13 +490,13 @@ void loop() {
       baroAbsAlt = (float)pressureAltMetersFromPa(p);
       if (baroBaseSet) {
         baroRelAlt = baroAbsAlt - (float)baroBaseAlt;
-        if (baroRelAlt < 0) baroRelAlt = 0;
+        if (baroRelAlt < 0) baroRelAlt = 0; // keep AGL non-negative for display
       }
     }
 
-    Serial.print("ALT baroAbs=");
+    Serial.print("ALT baroQNE=");
     if (isfinite(baroAbsAlt)) Serial.print(baroAbsAlt, 1); else Serial.print("N/A");
-    Serial.print(" m  baroRel=");
+    Serial.print(" m  baroAGL=");
     if (isfinite(baroRelAlt)) Serial.print(baroRelAlt, 1); else Serial.print("N/A");
     Serial.print(" m  gps=");
     if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1); else Serial.print("N/A");
@@ -508,22 +524,34 @@ void loop() {
     // If we have a good fix, 'A', otherwise 'V'
     char fix = gpsFixOK() ? 'A' : 'V';
 
-    int gpsAlt = gps.altitude.isValid() ? (int)lround(gps.altitude.meters()) : lastGpsAltM;
+    int gpsAltM = gps.altitude.isValid() ? (int)lround(gps.altitude.meters()) : lastGpsAltM;
 
-    // Relative baro altitude
-    int pAlt = gpsAlt;
+    // ABSOLUTE pressure altitude (QNE) for IGC pressure altitude field
+    int pAltQNE = 0;
     if (baroOK) {
       float p = bmp180.readPressure();
-      int absAlt = pressureAltMetersFromPa(p);
-      if (baroBaseSet) pAlt = absAlt - baroBaseAlt;
-      else pAlt = absAlt;
+      pAltQNE = pressureAltMetersFromPa(p); // may be negative
+    } else {
+      // If no baro, fall back to GPS altitude (still valid, but less ideal)
+      pAltQNE = gpsAltM;
     }
-    if (pAlt < 0) pAlt = 0;
 
+    // Standard B-record
     String line = "B" + two(hh) + two(mi) + two(ss) + lat + lon + String(fix)
-                + igcAlt5(pAlt) + igcAlt5(gpsAlt) + "\r\n";
-
+                + igcAlt5Signed(pAltQNE)         // pressure alt (signed)
+                + igcAlt5Unsigned(gpsAltM)       // gps alt (unsigned)
+                + "\r\n";
     igcFile.print(line);
+
+    // Optional L-record with AGL (relative to baseline), clamped >=0
+    if (baroOK && baroBaseSet) {
+      int agl = pAltQNE - baroBaseAlt;
+      if (agl < 0) agl = 0;
+      // Example: LAGL00012  (meters)
+      char lbuf[20];
+      snprintf(lbuf, sizeof(lbuf), "LAGL%05d\r\n", agl);
+      igcFile.print(lbuf);
+    }
 
     uint32_t now = millis();
     if (now - lastFlushMs >= SD_FLUSH_MS) {
