@@ -27,8 +27,6 @@ Logs valid IGC B-records with absolute pressure altitude (QNE) and GNSS altitude
 
 ✅ Serial debug output every 2 seconds
 
-❌ No AGL in IGC (no LAGL records, by design)
-
 📄 What This Logger Records
 B Record Fields
 
