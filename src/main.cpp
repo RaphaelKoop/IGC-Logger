@@ -9,7 +9,7 @@
 //   * B record: BHHMMSS LAT LON AV PPPPP GGGGG + FXA(3) + SIU(2)
 // - NO "LAGLxxxxx" records (removed)
 // - Pressure altitude = ISA/QNE 1013.25 hPa from BMP180 (signed 5 chars)
-// - GNSS altitude = GNSS height (meters), 00000 if invalid/2D
+// - GNSS altitude = GNSS height (meters), 00000 if invalid/2D/unstable
 //
 // LOG RATE: 5 Hz (200 ms)
 // SD: write at 5 Hz, flush once per second
@@ -18,10 +18,18 @@
 // - SD missing/error:   ON 2s, OFF 2s, repeat
 // - GPS time NOT OK:    fast blink (~5 Hz)
 // - GPS time OK no fix: slow blink (1 Hz)
-// - GPS fix OK:         solid ON (ready)
+// - GPS fix OK:         solid ON (ready)  <-- now requires >=6 sats + stable GNSS altitude
 // - RECORDING active:   double blink per second
 //
 // Serial status: every 2s prints time/fix/sats/baro/sd/recording/owner/pwm + altitude debug
+//
+// NEW: "Altitude stability gate"
+// - We only claim a proper fix (and light solid LED / write 'A') when:
+//   * location is valid+fresh
+//   * sats >= 6
+//   * altitude is valid+fresh
+//   * after a short warmup period
+//   * and altitude stays within a small range during a window (no big jumps)
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -60,6 +68,13 @@ static const bool LED_ACTIVE_LOW = true;
 static const uint32_t LOG_INTERVAL_MS = 200; // 5 Hz
 static const uint32_t SD_FLUSH_MS     = 1000;
 
+// ---------------- GNSS "solid fix" gate ----------------
+// Tune these if needed:
+static const int      GNSS_SATS_MIN_FOR_SOLID = 6;     // >=6 sats
+static const uint32_t GNSS_WARMUP_MS          = 8000;  // wait after first plausible fix
+static const uint32_t GNSS_STABLE_WIN_MS      = 4000;  // stability window
+static const float    GNSS_MAX_SPREAD_M       = 8.0f;  // max (max-min) altitude spread in window
+
 // ---------------- Globals ----------------
 HardwareSerial GPS(1);
 TinyGPSPlus gps;
@@ -91,6 +106,13 @@ bool ledState = false;
 String lastLatStr = "0000000N";
 String lastLonStr = "00000000E";
 
+// GNSS stability tracking
+static bool     gnssSeenPlausibleFix = false;
+static uint32_t gnssFirstFixMs = 0;
+static uint32_t gnssWinStartMs = 0;
+static float    gnssAltMin =  1e9f;
+static float    gnssAltMax = -1e9f;
+
 // ---------------- Helpers ----------------
 static String two(int v) { return (v < 10) ? "0" + String(v) : String(v); }
 
@@ -103,14 +125,74 @@ static bool gpsTimeOK() {
   return gps.time.isValid() && gps.date.isValid();
 }
 
-// “Proper” fix: location valid + fresh + sats>=4 + altitude valid (3D)
-static bool gpsFixOK() {
+// Basic "location OK" (fresh lat/lon + some sats)
+static bool gpsLocOK_basic() {
   if (!gps.location.isValid()) return false;
   if (gps.location.age() > 3000) return false;
-  if (gps.satellites.isValid() && gps.satellites.value() < 4) return false;
-  if (!gps.altitude.isValid()) return false;
-  if (gps.altitude.age() > 3000) return false;
+  int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  if (sats < 4) return false;
   return true;
+}
+
+// GNSS altitude stability gate
+static bool gnssAltStableOK() {
+  // need fresh location
+  if (!gps.location.isValid() || gps.location.age() > 3000) return false;
+
+  // need altitude and it must be fresh
+  if (!gps.altitude.isValid() || gps.altitude.age() > 3000) return false;
+
+  int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  if (sats < GNSS_SATS_MIN_FOR_SOLID) return false;
+
+  uint32_t now = millis();
+
+  // start warmup timer on first plausible fix
+  if (!gnssSeenPlausibleFix) {
+    gnssSeenPlausibleFix = true;
+    gnssFirstFixMs = now;
+    gnssWinStartMs = now;
+    gnssAltMin =  1e9f;
+    gnssAltMax = -1e9f;
+  }
+
+  // warmup period
+  if (now - gnssFirstFixMs < GNSS_WARMUP_MS) return false;
+
+  // update min/max within sliding window
+  if (now - gnssWinStartMs > GNSS_STABLE_WIN_MS) {
+    gnssWinStartMs = now;
+    gnssAltMin =  1e9f;
+    gnssAltMax = -1e9f;
+  }
+
+  float a = (float)gps.altitude.meters();
+  if (a < gnssAltMin) gnssAltMin = a;
+  if (a > gnssAltMax) gnssAltMax = a;
+
+  // stable if spread small enough
+  return (gnssAltMax - gnssAltMin) <= GNSS_MAX_SPREAD_M;
+}
+
+// “Proper” fix for LED + 'A' in IGC:
+// - location valid + fresh
+// - sats >= 6
+// - altitude valid + fresh
+// - altitude stable over time
+static bool gpsFixOK() {
+  if (!gpsLocOK_basic()) return false;
+  int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  if (sats < GNSS_SATS_MIN_FOR_SOLID) return false;
+  return gnssAltStableOK();
+}
+
+// Reset GNSS stability tracker (call when starting a new recording)
+static void resetGnssStability() {
+  gnssSeenPlausibleFix = false;
+  gnssFirstFixMs = 0;
+  gnssWinStartMs = 0;
+  gnssAltMin =  1e9f;
+  gnssAltMax = -1e9f;
 }
 
 // ISA pressure altitude from pressure in Pa (QNE 1013.25)
@@ -224,7 +306,7 @@ static void writeIgcHeaders() {
   igcFile.print("HFFXA050\r\n"); // typical fix accuracy category (meters)
   igcFile.print("HFDTM100GPSDATUM:WGS-1984\r\n");
 
-  igcFile.print("HFRFWFIRMWAREVERSION:ESP32-C3-RC-IGC-5HZ-PWM-FXA-SIU\r\n");
+  igcFile.print("HFRFWFIRMWAREVERSION:ESP32-C3-RC-IGC-5HZ-PWM-FXA-SIU-ALTSTABLE\r\n");
   igcFile.print("HFRHWHARDWAREVERSION:ESP32-C3+BN180+SD+BMP180\r\n");
   igcFile.print("HFFTYFRTYPE:XXX,ESP32C3-LOGGER\r\n");
   igcFile.print("HFGPS:u-blox,BN-180\r\n");
@@ -257,6 +339,9 @@ static bool startRecording(Owner owner) {
   // reset last-known position placeholders for this file
   lastLatStr = "0000000N";
   lastLonStr = "00000000E";
+
+  // reset GNSS stability tracker so solid-fix starts "fresh"
+  resetGnssStability();
 
   writeIgcHeaders();
 
@@ -331,7 +416,7 @@ static void handlePwmControl() {
   if (!pwmWantsRec && recording && recOwner == OWNER_PWM) stopRecording();
 }
 
-// LED logic (from your older working version)
+// LED logic (now uses "solid fix" gate)
 static void updateLED() {
   uint32_t now = millis();
 
@@ -350,13 +435,13 @@ static void updateLED() {
     return;
   }
 
-  // GPS fix OK (ready): solid on
+  // GPS fix OK (ready): solid on (>=6 sats + stable GNSS altitude)
   if (gpsFixOK()) {
     setLED(true);
     return;
   }
 
-  // GPS time OK, but no fix: slow blink 1 Hz (toggle every 500ms)
+  // GPS time OK, but no solid fix: slow blink 1 Hz (toggle every 500ms)
   if (gpsTimeOK()) {
     if (now - lastLedToggle > 500) {
       lastLedToggle = now;
@@ -386,8 +471,8 @@ void setup() {
   if (PIN_PWM_IN >= 0) pinMode(PIN_PWM_IN, INPUT);
   lastPwmOkMs = millis();
 
-  Serial.println("ESP32-C3 IGC LOGGER STARTED (5Hz, FXA+SIU, NO LAGL, QNE press-alt, GNSS alt 00000 if invalid)");
-  Serial.println("LED: SD err 2s/2s, time NO fast, time OK no fix slow, fix OK solid, recording double blink");
+  Serial.println("ESP32-C3 IGC LOGGER STARTED (5Hz, FXA+SIU, NO LAGL, QNE press-alt, GNSS alt 00000 if invalid/unstable)");
+  Serial.println("LED: SD err 2s/2s, time NO fast, time OK no solid-fix slow, solid-fix OK solid, recording double blink");
 
   // I2C + BMP180
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -416,17 +501,21 @@ void loop() {
   handlePwmControl();
   updateLED();
 
-  // Serial status every 2s (from your older version)
+  // Serial status every 2s
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > 2000) {
     lastStatus = millis();
 
+    int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : -1;
+
     Serial.print("GPS time=");
     Serial.print(gpsTimeOK() ? "OK" : "NO");
-    Serial.print(" fix=");
+
+    Serial.print(" solidFix=");
     Serial.print(gpsFixOK() ? "OK" : "NO");
+
     Serial.print(" sats=");
-    Serial.print(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
+    Serial.print(sats);
 
     Serial.print(" baro=");
     Serial.print(baroOK ? "OK" : "NO");
@@ -448,13 +537,17 @@ void loop() {
       int absQne = pressureAltMetersFromPa(p);
       baroQne = (float)absQne;
     }
+
     float gpsAlt = (gps.altitude.isValid() && gps.altitude.age() <= 3000) ? gps.altitude.meters() : NAN;
 
     Serial.print("ALT baroQNE=");
     if (isfinite(baroQne)) Serial.print(baroQne, 1); else Serial.print("N/A");
-    Serial.print(" m  gps=");
+
+    Serial.print(" m  gpsRaw=");
     if (isfinite(gpsAlt)) Serial.print(gpsAlt, 1); else Serial.print("N/A");
-    Serial.println(" m");
+
+    Serial.print(" m  altStable=");
+    Serial.println(gnssAltStableOK() ? "YES" : "NO");
   }
 
   // Write IGC B-record at 5 Hz while recording
@@ -468,8 +561,9 @@ void loop() {
     int mi = gps.time.minute();
     int ss = gps.time.second();
 
-    // Fix validity: A = 3D with altitude valid, V otherwise
-    char fix = gpsFixOK() ? 'A' : 'V';
+    // "Solid" fix validity: A only when stable gate passes, otherwise V
+    bool solidFix = gpsFixOK();
+    char fix = solidFix ? 'A' : 'V';
 
     // Position: if current invalid, repeat last known (spec guidance)
     String latStr = lastLatStr;
@@ -481,14 +575,17 @@ void loop() {
       lastLonStr = lonStr;
     }
 
-    // GNSS altitude: 00000 if invalid
-    int gnssAltM = (gpsFixOK() && gps.altitude.isValid() && gps.altitude.age() <= 3000)
-                     ? (int)lround(gps.altitude.meters())
-                     : 0;
-    if (gnssAltM < 0) gnssAltM = 0;
-    if (gnssAltM > 99999) gnssAltM = 99999;
+    // GNSS altitude: 00000 unless solidFix (stable/3D)
+    int gnssAltM = 0;
+    if (solidFix) {
+      gnssAltM = (int)lround(gps.altitude.meters());
+      if (gnssAltM < 0) gnssAltM = 0;
+      if (gnssAltM > 99999) gnssAltM = 99999;
+    } else {
+      gnssAltM = 0;
+    }
 
-    // Pressure altitude (QNE/ISA) from baro: if baro missing, use 0
+    // Pressure altitude (QNE/ISA) from baro (can be negative); if baro missing -> 00000
     int pAltM = 0;
     if (baroOK) {
       float p = bmp180.readPressure(); // Pa
@@ -508,7 +605,7 @@ void loop() {
     snprintf(fxaBuf, sizeof(fxaBuf), "%03d", fxa);
 
     // SIU (satellites in use)
-    int siu = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    int siu = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
     if (siu < 0) siu = 0;
     if (siu > 99) siu = 99;
     char siuBuf[3];
